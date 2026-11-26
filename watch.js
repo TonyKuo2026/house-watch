@@ -16,14 +16,25 @@ const CONFIG = {
     { name: '泰山區', url: 'https://buy.yungching.com.tw/list/新北市-泰山區_c/' },
   ],
   YC_MAX_PAGES: 30,        // 永慶每區最多翻幾頁
+  YC_INTERVAL_MIN: [60, 120], // 永慶每次檢查間隔（分鐘），在這個範圍內隨機，避免被當成機器人
+  YC_FAIL_WARN: 3,          // 永慶連續失敗幾次就傳警告到 Discord
 
-  QUIET_HOURS: null, // 例如 [0, 7] = 台灣時間 0:00~7:00 先不通知，早上一起送；null = 隨時通知
+  SKIP_HOURS: [0, 8],       // 台灣時間 0:00~8:00 不檢查
+  P591_MAX_PAGES: 5,        // 591 最多往後翻幾頁（早上補齊半夜的新物件用）
 
   TEST_SEND: process.env.TEST_SEND === 'true', // 在 GitHub 手動執行時勾選「測試」即可
 };
 // ============================================================
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Cache-Control': 'no-cache',
+  'Upgrade-Insecure-Requests': '1',
+};
+const rand = (a, b) => a + Math.random() * (b - a);
 let store = {};
 try { store = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) {}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -43,27 +54,34 @@ const ctx = { helpers: { httpRequest } };
 
 
 // ---------- 591 ----------
-async function fetch591(src) {
-  const url = `https://bff-house.591.com.tw/v1/web/sale/list?type=2&category=1&shType=list&regionid=3&section=${src.section}&order=posttime_desc&firstRow=0`;
-  let res = await this.helpers.httpRequest({ url, headers: { 'User-Agent': UA, Accept: 'application/json' } });
-  if (typeof res === 'string') res = JSON.parse(res);
-  const list = (res && res.data && res.data.house_list) || [];
+async function fetch591(src, seen, firstTime) {
   const out = [];
-  for (const h of list) {
-    if (!h || !h.houseid || h.is_newhouse || String(h.type) !== '2') continue;
-    const sec = h.section_name || src.name;
-    if (sec !== src.name) continue;
-    const info = [h.room, h.area ? `${h.area}坪` : '', h.floor, h.showhouseage].filter(Boolean).join('｜');
-    out.push({
-      key: `591-${h.houseid}`,
-      source: '591',
-      district: sec,
-      title: h.title || '',
-      price: h.price ? `${h.showprice || h.price}萬` : '',
-      info,
-      address: `${sec}${h.address || ''}`,
-      url: `https://sale.591.com.tw/home/house/detail/2/${h.houseid}.html`,
-    });
+  const maxPages = firstTime ? 1 : CONFIG.P591_MAX_PAGES;
+  for (let page = 0; page < maxPages; page++) {
+    const url = `https://bff-house.591.com.tw/v1/web/sale/list?type=2&category=1&shType=list&regionid=3&section=${src.section}&order=posttime_desc&firstRow=${page * 30}`;
+    let res = await this.helpers.httpRequest({ url, headers: { 'User-Agent': UA, Accept: 'application/json' } });
+    if (typeof res === 'string') res = JSON.parse(res);
+    const list = (res && res.data && res.data.house_list) || [];
+    let hitSeen = false;
+    for (const h of list) {
+      if (!h || !h.houseid || h.is_newhouse || String(h.type) !== '2') continue;
+      const sec = h.section_name || src.name;
+      if (sec !== src.name) continue;
+      if (seen[`591-${h.houseid}`]) hitSeen = true;
+      const info = [h.room, h.area ? `${h.area}坪` : '', h.floor, h.showhouseage].filter(Boolean).join('｜');
+      out.push({
+        key: `591-${h.houseid}`,
+        source: '591',
+        district: sec,
+        title: h.title || '',
+        price: h.price ? `${h.showprice || h.price}萬` : '',
+        info,
+        address: `${sec}${h.address || ''}`,
+        url: `https://sale.591.com.tw/home/house/detail/2/${h.houseid}.html`,
+      });
+    }
+    if (hitSeen || list.length < 20) break; // 已經接到看過的物件，就不用再往後翻
+    await sleep(rand(800, 1500));
   }
   return out;
 }
@@ -111,14 +129,14 @@ async function fetchYC(src) {
   const pagesSeen = {}; // 同一個 ID 出現在好幾頁 = 廣告版位
   for (let pg = 1; pg <= CONFIG.YC_MAX_PAGES; pg++) {
     const url = pg === 1 ? src.url : `${src.url}?pg=${pg}`;
-    const html = await this.helpers.httpRequest({ url: encodeURI(url), headers: { 'User-Agent': UA }, json: false });
+    const html = await this.helpers.httpRequest({ url: encodeURI(url), headers: { ...BROWSER_HEADERS, Referer: pg === 1 ? 'https://buy.yungching.com.tw/' : encodeURI(src.url) }, json: false });
     const items = parseYC(String(html), src.name);
     if (!items.some((it) => !all.has(it.key))) break; // 沒有新的就代表翻到底了
     for (const it of items) {
       pagesSeen[it.key] = (pagesSeen[it.key] || 0) + 1;
       if (!all.has(it.key)) all.set(it.key, it);
     }
-    await sleep(800);
+    await sleep(rand(2000, 4500)); // 放慢翻頁速度，像真人瀏覽
   }
   return [...all.values()].filter((it) => pagesSeen[it.key] === 1);
 }
@@ -160,15 +178,37 @@ async function pushDiscord(items, header) {
 
 async function main() {
   // ---------- 主流程 ----------
+  store.seen = store.seen || {};
+  store.seeded = store.seeded || {};
+  store.pending = store.pending || [];
+  const now = Date.now();
+  const hour = new Date(now + 8 * 3600e3).getUTCHours();
+  if (!CONFIG.TEST_SEND && CONFIG.SKIP_HOURS && hour >= CONFIG.SKIP_HOURS[0] && hour < CONFIG.SKIP_HOURS[1]) {
+    console.log(`台灣時間 ${hour} 點，休息時段不檢查`);
+    return;
+  }
+
   const results = []; // { srcKey, ok, items }
   for (const s of CONFIG.SOURCES_591) {
-    try { results.push({ srcKey: `591-${s.section}`, ok: true, items: await fetch591.call(this, s) }); }
-    catch (e) { results.push({ srcKey: `591-${s.section}`, ok: false, items: [] }); log.push(`591 ${s.name} 失敗：${e.message}`); }
+    const key = `591-${s.section}`;
+    try { results.push({ srcKey: key, ok: true, items: await fetch591.call(this, s, store.seen, !store.seeded[key]) }); }
+    catch (e) { results.push({ srcKey: key, ok: false, items: [] }); log.push(`591 ${s.name} 失敗：${e.message}`); }
     await sleep(800);
   }
-  for (const s of CONFIG.SOURCES_YC) {
-    try { results.push({ srcKey: `YC-${s.name}`, ok: true, items: await fetchYC.call(this, s) }); }
-    catch (e) { results.push({ srcKey: `YC-${s.name}`, ok: false, items: [] }); log.push(`永慶 ${s.name} 失敗：${e.message}`); }
+
+  // 永慶：每 1~2 小時（隨機）才檢查一次
+  const ycDue = CONFIG.TEST_SEND || !store.ycNextAt || now >= store.ycNextAt;
+  let ycTried = false, ycAllOk = true;
+  if (ycDue) {
+    ycTried = true;
+    for (const s of CONFIG.SOURCES_YC) {
+      try { results.push({ srcKey: `YC-${s.name}`, ok: true, items: await fetchYC.call(this, s) }); }
+      catch (e) { ycAllOk = false; results.push({ srcKey: `YC-${s.name}`, ok: false, items: [] }); log.push(`永慶 ${s.name} 失敗：${e.message}`); }
+      await sleep(rand(3000, 6000));
+    }
+    if (!CONFIG.TEST_SEND) store.ycNextAt = now + rand(CONFIG.YC_INTERVAL_MIN[0], CONFIG.YC_INTERVAL_MIN[1]) * 60e3;
+  } else {
+    log.push(`永慶下次檢查：約 ${Math.round((store.ycNextAt - now) / 60e3)} 分鐘後`);
   }
   
   // 永慶同一個 ID 同時出現在兩區 = 廣告版位，排除
@@ -183,10 +223,6 @@ async function main() {
     return;
   }
   
-  store.seen = store.seen || {};
-  store.seeded = store.seeded || {};
-  store.pending = store.pending || [];
-  const now = Date.now();
   const today = Math.floor(now / 864e5); // 以「天」為單位，避免每 10 分鐘都要存檔
   // 舊格式（毫秒時間戳）轉成天數
   for (const k of Object.keys(store.seen)) if (store.seen[k] > 1e7) store.seen[k] = Math.floor(store.seen[k] / 864e5);
@@ -207,11 +243,26 @@ async function main() {
   store.pending.push(...newItems);
   if (store.pending.length > 300) store.pending = store.pending.slice(-300);
   
-  const hour = new Date(now + 8 * 3600e3).getUTCHours();
-  const quiet = !!(CONFIG.QUIET_HOURS && hour >= CONFIG.QUIET_HOURS[0] && hour < CONFIG.QUIET_HOURS[1]);
+  // 永慶連續失敗的警告／恢復通知
+  const notices = [];
+  if (ycTried) {
+    if (ycAllOk) {
+      if (store.ycWarned) notices.push('✅ 永慶已恢復正常，繼續幫你盯新物件。');
+      store.ycFail = 0; store.ycWarned = false;
+    } else {
+      store.ycFail = (store.ycFail || 0) + 1;
+      if (store.ycFail >= CONFIG.YC_FAIL_WARN && !store.ycWarned) {
+        notices.push(`⚠️ 永慶已經連續 ${store.ycFail} 次抓不到資料（可能被網站擋住），這段期間永慶的新物件不會通知。591 不受影響。`);
+        store.ycWarned = true;
+      }
+    }
+  }
+  for (const text of notices) {
+    try { await postDiscord.call(this, { content: text }); } catch (e) { log.push(`警告訊息傳送失敗：${e.message}`); }
+  }
   
   let pushed = 0;
-  if (store.pending.length && !quiet) {
+  if (store.pending.length) {
     const batch = store.pending;
     try {
       await pushDiscord.call(this, batch, `🏠 新物件 ${batch.length} 筆`);
@@ -224,7 +275,7 @@ async function main() {
   
   fs.writeFileSync(STATE_FILE, JSON.stringify(store));
   console.log(JSON.stringify({
-    newFound: newItems.length, pushed, pendingLeft: store.pending.length, quiet, log,
+    newFound: newItems.length, pushed, pendingLeft: store.pending.length, ycChecked: ycTried, ycFail: store.ycFail || 0, log,
     counts: results.map((r) => ({ src: r.srcKey, ok: r.ok, n: r.items.length })),
   }, null, 2));
 }
