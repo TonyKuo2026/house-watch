@@ -187,21 +187,22 @@ async function main() {
   store.seeded = store.seeded || {};
   store.pending = store.pending || [];
   const now = Date.now();
+  const today = Math.floor(now / 864e5); // 以「天」為單位，避免每 10 分鐘都要存檔
+  // 舊格式（毫秒時間戳）轉成天數
+  for (const k of Object.keys(store.seen)) if (store.seen[k] > 1e7) store.seen[k] = Math.floor(store.seen[k] / 864e5);
   const newItems = [];
   for (const r of results) {
     if (!r.ok || r.items.length === 0) continue;
     const firstTime = !store.seeded[r.srcKey];
     for (const it of r.items) {
-      if (!store.seen[it.key]) {
-        store.seen[it.key] = now;
-        if (!firstTime) newItems.push(it);
-      }
+      if (!store.seen[it.key] && !firstTime) newItems.push(it);
+      store.seen[it.key] = today; // 記錄「最後一次看到」的日期，掛賣再久也不會被重複通知
     }
     store.seeded[r.srcKey] = true; // 第一次執行只記錄現有物件，不推播
   }
   
-  // 清掉 90 天前的紀錄，避免越存越大
-  for (const k of Object.keys(store.seen)) if (now - store.seen[k] > 90 * 864e5) delete store.seen[k];
+  // 下架超過 90 天的物件才刪掉紀錄，避免越存越大
+  for (const k of Object.keys(store.seen)) if (today - store.seen[k] > 90) delete store.seen[k];
   
   store.pending.push(...newItems);
   if (store.pending.length > 300) store.pending = store.pending.slice(-300);
