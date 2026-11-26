@@ -71,23 +71,26 @@ async function fetch591(src) {
 // ---------- 永慶 ----------
 function parseYC(html, district) {
   const out = [];
-  const re = /href="(?:https:\/\/buy\.yungching\.com\.tw)?\/house\/(\d+)[^"]*"/g;
+  // 永慶的連結格式：href="house/7506076"（可能有或沒有開頭斜線、網域）
+  const re = /href="(?:https:\/\/buy\.yungching\.com\.tw)?\/?house\/(\d+)[^"]*"/g;
   const hits = [];
   let m;
   while ((m = re.exec(html)) !== null) hits.push({ id: m[1], pos: m.index });
   for (let i = 0; i < hits.length; i++) {
     const end = i + 1 < hits.length ? hits[i + 1].pos : Math.min(html.length, hits[i].pos + 6000);
     const text = html.slice(hits[i].pos, end)
+      .replace(/<[^>]*$/, '')
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ')
       .replace(/<[^>]+>/g, ' ')
       .replace(/^[^>]*>/, ' ')
       .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
       .replace(/\s+/g, ' ').trim();
     if (!text) continue;
-    const addr = (text.match(/新北市\S*?區\S*/) || [''])[0];
-    if (addr && !addr.includes(district)) continue; // 排除跨區廣告
+    const addr = (text.match(/[一-鿿]{2}[市縣][一-鿿]{1,3}?[區鄉鎮市][^\s]*/) || [''])[0];
+    if (!addr.includes(district)) continue; // 排除其他區域的廣告物件
     const title = text.split(' ')[0].slice(0, 60);
-    const price = (text.match(/([\d,]{3,})\s*萬/) || [])[1];
+    const price = (text.match(/([\d,]+)\s*$/) || [])[1]; // 卡片最後一個數字＝目前售價（萬）
     const layout = (text.match(/\d+房[^\s]*/) || [''])[0];
     out.push({
       key: `YC-${hits[i].id}`,
@@ -105,16 +108,19 @@ function parseYC(html, district) {
 
 async function fetchYC(src) {
   const all = new Map();
+  const pagesSeen = {}; // 同一個 ID 出現在好幾頁 = 廣告版位
   for (let pg = 1; pg <= CONFIG.YC_MAX_PAGES; pg++) {
     const url = pg === 1 ? src.url : `${src.url}?pg=${pg}`;
     const html = await this.helpers.httpRequest({ url: encodeURI(url), headers: { 'User-Agent': UA }, json: false });
     const items = parseYC(String(html), src.name);
-    let added = 0;
-    for (const it of items) if (!all.has(it.key)) { all.set(it.key, it); added++; }
-    if (added === 0) break; // 沒有新的就代表翻到底了
+    if (!items.some((it) => !all.has(it.key))) break; // 沒有新的就代表翻到底了
+    for (const it of items) {
+      pagesSeen[it.key] = (pagesSeen[it.key] || 0) + 1;
+      if (!all.has(it.key)) all.set(it.key, it);
+    }
     await sleep(800);
   }
-  return [...all.values()];
+  return [...all.values()].filter((it) => pagesSeen[it.key] === 1);
 }
 
 // ---------- Discord ----------
